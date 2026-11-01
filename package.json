@@ -1,0 +1,29 @@
+{
+  "name": "tennis-alpha-execution-gateway",
+  "version": "0.1.0",
+  "description": "Execution Gateway: hydrates live competitor features and drives order execution.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "test": "vitest run",
+    "worker": "tsx scripts/runWorker.ts",
+    "simulate": "tsx scripts/simulateOrder.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "ioredis": "5.4.1",
+    "lru-cache": "11.0.2",
+    "playwright": "1.49.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "tsx": "4.19.2",
+    "typescript": "5.7.2",
+    "vitest": "2.1.8"
+  }
+}

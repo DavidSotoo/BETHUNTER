@@ -1,0 +1,62 @@
+# ============================================================================
+# Tennis-Alpha :: Analytics Layer :: Configuration
+# ----------------------------------------------------------------------------
+# Single source of truth for the ETL + feature-engineering pipeline.
+# All magic numbers live here, never inline in code. Every change to model
+# behaviour must be auditable from this file alone.
+# ============================================================================
+
+paths:
+  raw_dir: "data/raw"            # Jeff Sackmann CSVs (atp_matches_YYYY.csv)
+  processed_dir: "data/processed"
+  models_dir: "data/models"
+  feature_store: "data/processed/feature_store.parquet"
+
+ingest:
+  # Sackmann file glob. Tour prefix is configurable for WTA reuse.
+  file_glob: "atp_matches_*.csv"
+  # Minimum year to include. Early-era data is noisy and the surface
+  # taxonomy is inconsistent pre-2000.
+  min_year: 2000
+  # Rows missing any of these are structurally unusable -> dropped.
+  required_columns:
+    - "tourney_date"
+    - "winner_id"
+    - "loser_id"
+    - "surface"
+
+elo:
+  # Base/default rating assigned to a player on first appearance.
+  initial_rating: 1500.0
+  # Logistic scale (classic Elo uses 400).
+  scale: 400.0
+  # K-factor schedule. Tennis Elo benefits from a decaying K: volatile
+  # early in a career (few matches), stable later. FiveThirtyEight-style.
+  k_factor:
+    base: 250.0        # numerator of the decay curve
+    shape: 0.4         # exponent controlling decay speed
+    offset: 5.0        # softens the curve at match_count = 0
+  # Per-surface Elo is tracked independently AND blended with global Elo.
+  # This weight controls how much surface-specific rating counts vs global.
+  surface_blend: 0.5
+  surfaces:
+    - "Hard"
+    - "Clay"
+    - "Grass"
+    - "Carpet"
+
+fatigue:
+  # Rolling window (days) over which recent match load is accumulated.
+  window_days: 14
+  # Minutes of court time are the primary fatigue signal when available;
+  # fall back to a per-match constant when 'minutes' is null.
+  default_match_minutes: 90
+  # Half-life (days) for exponential time-decay of fatigue contribution.
+  half_life_days: 7.0
+
+output:
+  # Columns kept for the training-ready feature store. The target is
+  # intentionally ABSENT here; it is assembled in the training module to
+  # keep this layer label-agnostic and reusable for inference.
+  drop_raw_after_features: true
+  float_precision: 6
