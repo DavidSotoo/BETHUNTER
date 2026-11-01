@@ -33,3 +33,6 @@ coverage/
 playwright-report/
 test-results/
 /playwright/.cache/
+
+# Packaged archives / binaries (kept locally, not tracked)
+*.zip
