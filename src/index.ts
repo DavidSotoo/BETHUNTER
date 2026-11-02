@@ -13,46 +13,13 @@ import { config } from './config/index.js';
 import { MetricsCollector } from './telemetry/MetricsCollector.js';
 import { CircuitBreaker } from './services/CircuitBreaker.js';
 import { BrowserManager } from './browser/BrowserManager.js';
-import { FeatureLoader, FeatureStoreClient } from './services/FeatureLoader.js';
+import { FeatureLoader } from './services/FeatureLoader.js';
+import { RedisFeatureStoreClient } from './services/RedisFeatureStoreClient.js';
 import { OrderExecutor } from './executors/OrderExecutor.js';
 import { OrderWorker } from './workers/OrderWorker.js';
 import { createHealthServer } from './server.js';
-import type { PlayerFeatures } from './types/features.js';
 
 const logger = console;
-
-/**
- * PLACEHOLDER Feature Store client.
- *
- * TODO: replace with the real REST/gRPC/DB adapter before production. It
- * returns deterministic neutral-ish vectors so the gateway is runnable end to
- * end; a startup warning is logged so this never ships silently.
- */
-function createFeatureStoreClient(): FeatureStoreClient {
-  logger.warn(
-    'index: using PLACEHOLDER Feature Store client -- wire the real adapter before production',
-  );
-  return {
-    async fetch(playerId: string, signal: AbortSignal): Promise<PlayerFeatures> {
-      // Honour the loader's deadline even in the placeholder.
-      await new Promise<void>((resolve, reject) => {
-        const t = setTimeout(resolve, 5);
-        signal.addEventListener('abort', () => {
-          clearTimeout(t);
-          reject(new Error('aborted'));
-        });
-      });
-      const seed = [...playerId].reduce((a, c) => a + c.charCodeAt(0), 0);
-      return {
-        id: playerId,
-        elo: 1800 + (seed % 400),
-        fatigueScore: seed % 50,
-        formRating: (seed % 20) - 10,
-        updatedAt: Date.now(),
-      };
-    },
-  };
-}
 
 async function main(): Promise<void> {
   // --- Shared telemetry + resilience (constructed first so both the worker
@@ -68,9 +35,12 @@ async function main(): Promise<void> {
   });
 
   // --- Pipeline dependencies ---
+  // The worker's connection does blocking BRPOP, which holds the socket; the
+  // Feature Store needs its own connection so reads are never queued behind it.
   const redis = new Redis(config.redis.url, { maxRetriesPerRequest: null });
+  const featureRedis = new Redis(config.redis.url);
   const loader = new FeatureLoader({
-    client: createFeatureStoreClient(),
+    client: new RedisFeatureStoreClient({ redis: featureRedis, logger }),
     ttlMs: config.featureStore.ttlMs,
     fetchTimeoutMs: config.featureStore.fetchTimeoutMs,
     maxEntries: config.featureStore.maxEntries,
@@ -107,6 +77,7 @@ async function main(): Promise<void> {
       await new Promise<void>((resolve) => server.close(() => resolve())); // drain HTTP
       await browser.close(); // release Chromium / contexts
       redis.disconnect(); // drop the (possibly blocked BRPOP) connection
+      featureRedis.disconnect(); // drop the Feature Store connection
       logger.info('index: shutdown complete');
       process.exit(0);
     } catch (err) {
