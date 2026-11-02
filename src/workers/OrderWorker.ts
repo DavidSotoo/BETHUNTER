@@ -34,6 +34,7 @@ import { BrowserManager, BrowserSession } from '../browser/BrowserManager.js';
 import { CircuitBreaker, CircuitState } from '../services/CircuitBreaker.js';
 import { OrderExecutor } from '../executors/OrderExecutor.js';
 import { OrderExecutionResult, OrderExecutionStatus } from '../types/execution.js';
+import { MetricsCollector, OrderOutcome } from '../telemetry/MetricsCollector.js';
 import { config as defaultConfig, AppConfig } from '../config/index.js';
 import {
   ApprovedOrder,
@@ -49,6 +50,8 @@ export interface OrderWorkerOptions {
   executor?: OrderExecutor;
   /** Guards the pipeline. Defaults to one built from config. */
   breaker?: CircuitBreaker;
+  /** Collects per-order telemetry. Defaults to a fresh collector. */
+  metrics?: MetricsCollector;
   /** Defaults are taken from the shared config singleton. */
   config?: AppConfig;
   logger?: Pick<Console, 'info' | 'warn' | 'error'>;
@@ -96,6 +99,7 @@ export class OrderWorker {
   private readonly browser: BrowserManager;
   private readonly executor?: OrderExecutor;
   private readonly breaker: CircuitBreaker;
+  private readonly metrics: MetricsCollector;
   private readonly config: AppConfig;
   private readonly logger: Pick<Console, 'info' | 'warn' | 'error'>;
   private running = false;
@@ -107,6 +111,7 @@ export class OrderWorker {
     this.executor = opts.executor;
     this.config = opts.config ?? defaultConfig;
     this.logger = opts.logger ?? console;
+    this.metrics = opts.metrics ?? new MetricsCollector({ logger: this.logger });
     this.breaker =
       opts.breaker ??
       new CircuitBreaker({
@@ -115,7 +120,14 @@ export class OrderWorker {
         resetTimeoutMs: this.config.circuitBreaker.resetTimeoutMs,
         latencyThresholdMs: this.config.circuitBreaker.maxE2ELatencyMs,
         logger: this.logger,
+        // Feed circuit transitions straight into telemetry.
+        onStateChange: (from, to) => this.metrics.recordCircuitTransition(from, to),
       });
+  }
+
+  /** The telemetry collector, for exporting a performance snapshot. */
+  getMetrics(): MetricsCollector {
+    return this.metrics;
   }
 
   /** Begin draining the queue. Resolves when `stop()` is called. */
@@ -229,6 +241,25 @@ export class OrderWorker {
     // Feed the breaker: a block trips immediately; a success slower than the
     // configured E2E ceiling is treated as a (latency) failure.
     this.breaker.recordOutcome({ success, latencyMs: totalE2EMs, blocked });
+
+    // Record the cycle in telemetry. `execution` carries the precise outcome;
+    // absent it, a healthy pipeline is a no-op and a thrown one is an error.
+    const outcome: OrderOutcome = execution
+      ? execution.status
+      : success
+        ? 'NO_OP'
+        : 'PIPELINE_ERROR';
+    this.metrics.record({
+      orderId: order.orderId,
+      outcome,
+      blocked,
+      shadow,
+      hydrationMs: hydrationLatencyMs,
+      browserAcquisitionMs,
+      domCheckMs: execution?.latencyMs,
+      totalE2EMs,
+      circuitState: this.breaker.getState(),
+    });
 
     this.reportTelemetry({
       orderId: order.orderId,
