@@ -14,6 +14,7 @@
 
 import { createServer, type Server, type ServerResponse } from 'node:http';
 import { MetricsCollector } from './telemetry/MetricsCollector.js';
+import type { FinancialReport } from './types/settlement.js';
 
 export interface HealthServerOptions {
   metrics: MetricsCollector;
@@ -21,6 +22,8 @@ export interface HealthServerOptions {
   getCircuitState: () => string;
   /** Seconds the process/gateway has been up. Defaults to process uptime. */
   getUptimeSeconds?: () => number;
+  /** Settlement/CLV audit snapshot; when provided, enables GET /financial-report. */
+  getFinancialReport?: () => FinancialReport;
   logger?: Pick<Console, 'info' | 'error'>;
 }
 
@@ -34,7 +37,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 export function createHealthServer(opts: HealthServerOptions): Server {
-  const { metrics, getCircuitState } = opts;
+  const { metrics, getCircuitState, getFinancialReport } = opts;
   const logger = opts.logger ?? console;
   const uptimeSeconds = opts.getUptimeSeconds ?? (() => Math.floor(process.uptime()));
 
@@ -54,6 +57,15 @@ export function createHealthServer(opts: HealthServerOptions): Server {
 
       if (method === 'GET' && path === '/metrics') {
         sendJson(res, 200, metrics.exportMetricsSummary());
+        return;
+      }
+
+      if (method === 'GET' && path === '/financial-report') {
+        if (!getFinancialReport) {
+          sendJson(res, 503, { error: 'financial_report_unavailable' });
+          return;
+        }
+        sendJson(res, 200, getFinancialReport());
         return;
       }
 

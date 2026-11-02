@@ -12,6 +12,8 @@ import type { Server } from 'node:http';
 import { createHealthServer } from '../src/server.js';
 import { MetricsCollector, OrderMetricSample } from '../src/telemetry/MetricsCollector.js';
 import { CircuitState } from '../src/services/CircuitBreaker.js';
+import { SettlementService } from '../src/services/SettlementService.js';
+import type { HydratedOrderPayload, PlayerFeatures } from '../src/types/features.js';
 
 const silent = { info: () => {}, error: () => {} };
 
@@ -110,6 +112,75 @@ describe('health server', () => {
       expect(res.status).toBe(404);
       const body = (await res.json()) as { error: string };
       expect(body.error).toBe('not_found');
+    } finally {
+      await close(server);
+    }
+  });
+
+  it('GET /financial-report returns the settlement audit', async () => {
+    const feat = (id: string): PlayerFeatures => ({
+      id,
+      elo: 1900,
+      fatigueScore: 0,
+      formRating: 0,
+      updatedAt: 0,
+    });
+    const order: HydratedOrderPayload = {
+      orderId: 'o1',
+      playerAId: 'pa',
+      playerBId: 'pb',
+      matchId: 'm1',
+      selection: 'home',
+      targetOdds: 2.1,
+      stake: 10,
+      features: { playerA: feat('pa'), playerB: feat('pb') },
+      hydratedAt: 0,
+      hydrationSource: { playerA: 'cache', playerB: 'cache' },
+      hydrationLatencyMs: 0,
+    };
+    const settlement = new SettlementService({ logger: { warn: () => {} } });
+    settlement.recordEmittedOrder(order);
+    settlement.settleMatch('m1', 'home', 2.0); // WON, +5% CLV, +11 PnL
+
+    const metrics = new MetricsCollector({ logger: silent });
+    const server = createHealthServer({
+      metrics,
+      getCircuitState: () => CircuitState.CLOSED,
+      getFinancialReport: () => settlement.getFinancialReport(),
+      logger: silent,
+    });
+    const port = await listen(server);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/financial-report`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        totalOrders: number;
+        won: number;
+        winRatePct: number;
+        totalPnl: number;
+        btclRatePct: number;
+      };
+      expect(body.totalOrders).toBe(1);
+      expect(body.won).toBe(1);
+      expect(body.winRatePct).toBeCloseTo(100, 2);
+      expect(body.totalPnl).toBeCloseTo(11, 2);
+      expect(body.btclRatePct).toBeCloseTo(100, 2);
+    } finally {
+      await close(server);
+    }
+  });
+
+  it('GET /financial-report returns 503 when no settlement is wired', async () => {
+    const metrics = new MetricsCollector({ logger: silent });
+    const server = createHealthServer({
+      metrics,
+      getCircuitState: () => CircuitState.CLOSED,
+      logger: silent,
+    });
+    const port = await listen(server);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/financial-report`);
+      expect(res.status).toBe(503);
     } finally {
       await close(server);
     }
