@@ -35,6 +35,7 @@ import { CircuitBreaker, CircuitState } from '../services/CircuitBreaker.js';
 import { OrderExecutor } from '../executors/OrderExecutor.js';
 import { OrderExecutionResult, OrderExecutionStatus } from '../types/execution.js';
 import { MetricsCollector, OrderOutcome } from '../telemetry/MetricsCollector.js';
+import { SettlementService } from '../services/SettlementService.js';
 import { config as defaultConfig, AppConfig } from '../config/index.js';
 import {
   ApprovedOrder,
@@ -52,6 +53,8 @@ export interface OrderWorkerOptions {
   breaker?: CircuitBreaker;
   /** Collects per-order telemetry. Defaults to a fresh collector. */
   metrics?: MetricsCollector;
+  /** Records emitted/simulated orders for the CLV & PnL audit. Optional. */
+  settlement?: SettlementService;
   /** Defaults are taken from the shared config singleton. */
   config?: AppConfig;
   logger?: Pick<Console, 'info' | 'warn' | 'error'>;
@@ -100,6 +103,7 @@ export class OrderWorker {
   private readonly executor?: OrderExecutor;
   private readonly breaker: CircuitBreaker;
   private readonly metrics: MetricsCollector;
+  private readonly settlement?: SettlementService;
   private readonly config: AppConfig;
   private readonly logger: Pick<Console, 'info' | 'warn' | 'error'>;
   private running = false;
@@ -109,6 +113,7 @@ export class OrderWorker {
     this.loader = opts.loader;
     this.browser = opts.browser;
     this.executor = opts.executor;
+    this.settlement = opts.settlement;
     this.config = opts.config ?? defaultConfig;
     this.logger = opts.logger ?? console;
     this.metrics = opts.metrics ?? new MetricsCollector({ logger: this.logger });
@@ -181,6 +186,7 @@ export class OrderWorker {
     let success = false;
     let blocked = false;
     let execution: OrderExecutionResult | undefined;
+    let hydrated: HydratedOrderPayload | undefined;
 
     let hydrationLatencyMs = 0;
     let hydrationSource: HydrationSource = 'fallback';
@@ -188,7 +194,7 @@ export class OrderWorker {
 
     try {
       // --- 1. Hydration leg ---
-      const hydrated = await this.loader.hydrate(order);
+      hydrated = await this.loader.hydrate(order);
       hydrationLatencyMs = hydrated.hydrationLatencyMs;
       hydrationSource = aggregateSource(hydrated.hydrationSource);
 
@@ -260,6 +266,22 @@ export class OrderWorker {
       totalE2EMs,
       circuitState: this.breaker.getState(),
     });
+
+    // Record the emitted order for the CLV/PnL audit when it was placed (live)
+    // or simulated (shadow). Never let an audit failure break the worker loop.
+    if (
+      this.settlement &&
+      hydrated &&
+      (outcome === 'EXECUTED' || outcome === 'SHADOW_SIMULATED')
+    ) {
+      try {
+        this.settlement.recordEmittedOrder(hydrated);
+      } catch (err) {
+        this.logger.warn(
+          `OrderWorker: settlement record failed for order=${order.orderId}: ${(err as Error).message}`,
+        );
+      }
+    }
 
     this.reportTelemetry({
       orderId: order.orderId,

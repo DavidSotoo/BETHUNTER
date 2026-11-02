@@ -17,6 +17,7 @@ import { FeatureLoader } from './services/FeatureLoader.js';
 import { RedisFeatureStoreClient } from './services/RedisFeatureStoreClient.js';
 import { OrderExecutor } from './executors/OrderExecutor.js';
 import { OrderWorker } from './workers/OrderWorker.js';
+import { SettlementService } from './services/SettlementService.js';
 import { createHealthServer } from './server.js';
 
 const logger = console;
@@ -55,12 +56,24 @@ async function main(): Promise<void> {
     domSelectorTimeoutMs: config.execution.domSelectorTimeoutMs,
     shadowMode: config.shadowMode,
   });
-  const worker = new OrderWorker({ redis, loader, browser, executor, breaker, metrics });
+  // Shared across worker (records emitted orders) and server (reports); writes
+  // through to Redis for durable audit on the feature-store connection.
+  const settlement = new SettlementService({ redis: featureRedis, logger });
+  const worker = new OrderWorker({
+    redis,
+    loader,
+    browser,
+    executor,
+    breaker,
+    metrics,
+    settlement,
+  });
 
   // --- Health / metrics server ---
   const server = createHealthServer({
     metrics,
     getCircuitState: () => breaker.getState(),
+    getFinancialReport: () => settlement.getFinancialReport(),
     logger,
   });
   await new Promise<void>((resolve) => server.listen(config.server.httpPort, resolve));
