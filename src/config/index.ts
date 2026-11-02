@@ -70,6 +70,10 @@ export interface AppConfig {
      *  about:blank keeps the shadow path offline and side-effect free. */
     defaultTargetUrl: string;
   };
+  server: {
+    /** Port for the health / metrics HTTP server. */
+    httpPort: number;
+  };
 }
 
 /** Build an AppConfig from an environment (defaults to process.env). */
@@ -100,6 +104,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       headless: envBool(env, 'BROWSER_HEADLESS', true),
       navigationTimeoutMs: envNum(env, 'BROWSER_NAV_TIMEOUT_MS', 15_000),
       defaultTargetUrl: envStr(env, 'BROWSER_TARGET_URL', 'about:blank'),
+    },
+    server: {
+      httpPort: envNum(env, 'HTTP_PORT', 3000),
     },
   };
 }
