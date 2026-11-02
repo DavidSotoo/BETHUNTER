@@ -45,6 +45,14 @@ export interface AppConfig {
     fetchTimeoutMs: number;
     maxEntries: number;
   };
+  circuitBreaker: {
+    /** Consecutive failures (including latency breaches) that open the circuit. */
+    failureThreshold: number;
+    /** How long the circuit stays OPEN before probing in HALF-OPEN. */
+    resetTimeoutMs: number;
+    /** E2E latency above this marks an execution as a failure. */
+    maxE2ELatencyMs: number;
+  };
   browser: {
     /** When true, model the browser without launching real Chromium -- lets
      *  the harness run in CI with no browser binaries. Set BROWSER_SIMULATE=false
@@ -71,6 +79,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ttlMs: envNum(env, 'FEATURE_CACHE_TTL_MS', 45_000),
       fetchTimeoutMs: envNum(env, 'FEATURE_FETCH_TIMEOUT_MS', 50),
       maxEntries: envNum(env, 'FEATURE_CACHE_MAX', 10_000),
+    },
+    circuitBreaker: {
+      failureThreshold: envNum(env, 'CIRCUIT_BREAKER_FAILURE_THRESHOLD', 3),
+      resetTimeoutMs: envNum(env, 'CIRCUIT_BREAKER_RESET_TIMEOUT_MS', 30_000),
+      maxE2ELatencyMs: envNum(env, 'MAX_ALLOWED_E2E_LATENCY_MS', 500),
     },
     browser: {
       simulate: envBool(env, 'BROWSER_SIMULATE', true),
