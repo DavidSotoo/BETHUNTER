@@ -13,6 +13,7 @@
     "test": "vitest run",
     "worker": "tsx scripts/runWorker.ts",
     "simulate": "tsx scripts/simulateOrder.ts",
+    "feed": "tsx scripts/liveFeedSimulator.ts",
     "start": "node dist/index.js"
   },
   "dependencies": {
