@@ -17,7 +17,8 @@ import { Redis } from 'ioredis';
 import { config } from '../src/config/index.js';
 import { FeatureLoader, FeatureStoreClient } from '../src/services/FeatureLoader.js';
 import { BrowserManager } from '../src/browser/BrowserManager.js';
-import { OrderWorker, TransactionExecutor } from '../src/workers/OrderWorker.js';
+import { OrderWorker } from '../src/workers/OrderWorker.js';
+import { OrderExecutor } from '../src/executors/OrderExecutor.js';
 import type { PlayerFeatures } from '../src/types/features.js';
 
 /** Stand-in Feature Store: deterministic vectors with a realistic I/O delay. */
@@ -49,13 +50,6 @@ function createDemoStore(delayMs = 25): FeatureStoreClient {
   } as FeatureStoreClient & { fetches: number };
 }
 
-/** Demo final transaction. Never reached in SHADOW_MODE. */
-const demoExecutor: TransactionExecutor = {
-  async execute(session, order): Promise<void> {
-    console.log(`demoExecutor: placing bet for ${order.orderId} on ${session.id}`);
-  },
-};
-
 async function main(): Promise<void> {
   const redis = new Redis(config.redis.url, { maxRetriesPerRequest: null });
   const loader = new FeatureLoader({
@@ -69,7 +63,12 @@ async function main(): Promise<void> {
     headless: config.browser.headless,
     navigationTimeoutMs: config.browser.navigationTimeoutMs,
   });
-  const worker = new OrderWorker({ redis, loader, browser, executor: demoExecutor });
+  const executor = new OrderExecutor({
+    maxSlippageTolerance: config.execution.maxSlippageTolerance,
+    domSelectorTimeoutMs: config.execution.domSelectorTimeoutMs,
+    shadowMode: config.shadowMode,
+  });
+  const worker = new OrderWorker({ redis, loader, browser, executor });
 
   const shutdown = async (): Promise<void> => {
     console.log('\nrunWorker: shutting down...');
