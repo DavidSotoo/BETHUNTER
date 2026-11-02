@@ -6,25 +6,25 @@
  *     -> FeatureLoader.hydrate        (live competitor vectors)
  *     -> BrowserManager.acquire       (isolated Playwright context)
  *     -> navigate                     (load the execution surface)
- *     -> TransactionExecutor.execute  (the final, irreversible action)
+ *     -> OrderExecutor.executeOrder   (slippage guard + place-bet, DOM)
  *
  * SHADOW MODE
  *
- * When `config.shadowMode` is on, every step runs EXCEPT the final
- * `TransactionExecutor.execute`. We still hydrate, still open a real/simulated
- * browser context, still navigate -- so the latency breakdown is representative
- * -- but we never place the bet.
+ * When `config.shadowMode` is on, the OrderExecutor simulates the slippage
+ * verification and never clicks; the rest of the pipeline still runs so the
+ * latency breakdown stays representative.
  *
  * CIRCUIT BREAKER
  *
- * A CircuitBreaker guards the pipeline. Before pulling work the loop checks
- * `allowsRequest()`: while the circuit is OPEN the worker pauses consumption
- * (orders stay queued) instead of pounding a degraded downstream. Each order's
- * outcome -- failure, E2E latency over the threshold, or an explicit
- * WAF/Captcha/403 block -- is fed back so the breaker can trip or recover.
+ * A CircuitBreaker guards the pipeline. While OPEN the worker pauses
+ * consumption (orders stay queued). Each order's outcome is fed back:
+ *   - a thrown pipeline error, or an executor FAILED_DOM  -> breaker failure
+ *   - an E2E latency over the threshold                   -> breaker failure
+ *   - an explicit WAF/Captcha/403 block                   -> immediate trip
+ *   - EXECUTED / SHADOW_SIMULATED / REJECTED_SLIPPAGE     -> healthy (no trip)
+ * REJECTED_SLIPPAGE is a deliberate decision, so it never trips the breaker.
  *
- * Every step is timed with performance.now() and each order ends with a
- * structured telemetry block on the console.
+ * Every step is timed and each order ends with a structured telemetry block.
  */
 
 import { Redis } from 'ioredis';
@@ -32,6 +32,8 @@ import { performance } from 'node:perf_hooks';
 import { FeatureLoader } from '../services/FeatureLoader.js';
 import { BrowserManager, BrowserSession } from '../browser/BrowserManager.js';
 import { CircuitBreaker, CircuitState } from '../services/CircuitBreaker.js';
+import { OrderExecutor } from '../executors/OrderExecutor.js';
+import { OrderExecutionResult, OrderExecutionStatus } from '../types/execution.js';
 import { config as defaultConfig, AppConfig } from '../config/index.js';
 import {
   ApprovedOrder,
@@ -39,17 +41,12 @@ import {
   HydrationSource,
 } from '../types/features.js';
 
-/** The final, irreversible action, isolated so SHADOW_MODE can skip it. */
-export interface TransactionExecutor {
-  execute(session: BrowserSession, order: HydratedOrderPayload): Promise<void>;
-}
-
 export interface OrderWorkerOptions {
   redis: Redis;
   loader: FeatureLoader;
   browser: BrowserManager;
-  /** Omitted (or skipped by shadow mode) means no final transaction runs. */
-  executor?: TransactionExecutor;
+  /** Places the order (with slippage guard). Omitted = pipeline runs, no bet. */
+  executor?: OrderExecutor;
   /** Guards the pipeline. Defaults to one built from config. */
   breaker?: CircuitBreaker;
   /** Defaults are taken from the shared config singleton. */
@@ -65,8 +62,8 @@ interface OrderTelemetry {
   browserAcquisitionMs: number;
   totalE2EMs: number;
   shadow: boolean;
-  executed: boolean;
   circuitState: CircuitState;
+  execution?: OrderExecutionResult;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -86,8 +83,8 @@ function aggregateSource(s: {
 }
 
 /** Heuristic: does this error look like a WAF / Captcha / 403 wall? */
-function isBlockError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
+function isBlockError(msg: string | undefined): boolean {
+  if (!msg) return false;
   return /\b403\b|forbidden|captcha|\bwaf\b|access denied|blocked|rate.?limit|too many requests/i.test(
     msg,
   );
@@ -97,7 +94,7 @@ export class OrderWorker {
   private readonly redis: Redis;
   private readonly loader: FeatureLoader;
   private readonly browser: BrowserManager;
-  private readonly executor?: TransactionExecutor;
+  private readonly executor?: OrderExecutor;
   private readonly breaker: CircuitBreaker;
   private readonly config: AppConfig;
   private readonly logger: Pick<Console, 'info' | 'warn' | 'error'>;
@@ -132,7 +129,7 @@ export class OrderWorker {
 
     while (this.running) {
       // Circuit OPEN: pause consumption so orders stay queued and we stop
-      // hammering a degraded downstream. We re-check after a short backoff.
+      // hammering a degraded downstream. Re-check after a short backoff.
       if (!this.breaker.allowsRequest()) {
         await sleep(250);
         continue;
@@ -169,11 +166,10 @@ export class OrderWorker {
 
     const e2eStart = performance.now();
     let session: BrowserSession | undefined;
-    let executed = false;
     let success = false;
     let blocked = false;
+    let execution: OrderExecutionResult | undefined;
 
-    // Telemetry we can still fill in when a step throws early.
     let hydrationLatencyMs = 0;
     let hydrationSource: HydrationSource = 'fallback';
     let browserAcquisitionMs = 0;
@@ -196,25 +192,27 @@ export class OrderWorker {
           : this.config.browser.defaultTargetUrl;
       await session.navigate(targetUrl);
 
-      // --- 4. Final transaction (skipped in shadow mode) ---
-      if (shadow) {
-        this.logger.info(
-          `OrderWorker: [SHADOW] order=${hydrated.orderId} navigated to ${targetUrl}; transaction NOT executed`,
-        );
-      } else if (this.executor) {
-        await this.executor.execute(session, hydrated);
-        executed = true;
+      // --- 4. Execute with the slippage guard (shadow-aware inside) ---
+      if (this.executor) {
+        execution = await this.executor.executeOrder(session.page, hydrated);
+        // Only a genuine DOM/execution fault counts against the breaker; a
+        // slippage rejection is a healthy, intentional outcome.
+        success = execution.status !== 'FAILED_DOM';
+        if (execution.status === 'FAILED_DOM') {
+          blocked = isBlockError(execution.error);
+        }
       } else {
         this.logger.warn(
-          `OrderWorker: order=${hydrated.orderId} has no executor configured; transaction skipped`,
+          `OrderWorker: order=${hydrated.orderId} has no executor configured; nothing placed`,
         );
+        success = true; // the pipeline itself was healthy
       }
-      success = true;
     } catch (err) {
-      blocked = isBlockError(err);
+      const msg = (err as Error).message;
+      blocked = isBlockError(msg);
       this.logger.error(
         `OrderWorker: pipeline failed for order=${order.orderId}` +
-          `${blocked ? ' [BLOCK detected]' : ''}: ${(err as Error).message}`,
+          `${blocked ? ' [BLOCK detected]' : ''}: ${msg}`,
       );
     } finally {
       if (session) {
@@ -239,18 +237,14 @@ export class OrderWorker {
       browserAcquisitionMs,
       totalE2EMs,
       shadow,
-      executed,
       circuitState: this.breaker.getState(),
+      execution,
     });
   }
 
   /** Structured, human-readable latency breakdown per order. */
   private reportTelemetry(t: OrderTelemetry): void {
-    const mode = t.shadow
-      ? 'SHADOW (transaction skipped)'
-      : t.executed
-        ? 'LIVE (executed)'
-        : 'LIVE (no-op)';
+    const mode = modeLabel(t.shadow, t.execution?.status);
     const lines = [
       '──────── Execution Telemetry ────────',
       `[Order ID]                    ${t.orderId}`,
@@ -258,9 +252,32 @@ export class OrderWorker {
       `Browser Acquisition Latency   ${t.browserAcquisitionMs.toFixed(3)} ms`,
       `Total E2E Execution Latency   ${t.totalE2EMs.toFixed(3)} ms`,
       `Circuit State                 ${t.circuitState}`,
-      `Mode                          ${mode}`,
-      '─────────────────────────────────────',
     ];
+    if (t.execution) {
+      const e = t.execution;
+      lines.push(
+        `Execution Status              ${e.status}`,
+        `Odds (req -> exec)            ${e.requestedOdds}` +
+          `${e.executedOdds !== undefined ? ` -> ${e.executedOdds}` : ''} ` +
+          `(slippage ${(e.slippage * 100).toFixed(2)}%)`,
+      );
+      if (e.error) lines.push(`Execution Error               ${e.error}`);
+    }
+    lines.push(`Mode                          ${mode}`, '─────────────────────────────────────');
     this.logger.info(lines.join('\n'));
+  }
+}
+
+function modeLabel(shadow: boolean, status?: OrderExecutionStatus): string {
+  if (shadow) return 'SHADOW (transaction skipped)';
+  switch (status) {
+    case 'EXECUTED':
+      return 'LIVE (executed)';
+    case 'REJECTED_SLIPPAGE':
+      return 'LIVE (rejected: slippage)';
+    case 'FAILED_DOM':
+      return 'LIVE (failed: DOM)';
+    default:
+      return 'LIVE (no-op)';
   }
 }

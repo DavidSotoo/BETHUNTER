@@ -16,11 +16,17 @@
  *                browsers, while still producing realistic latency telemetry.
  */
 
-import type { Browser } from 'playwright';
+import type { Browser, Page } from 'playwright';
 
 export interface BrowserSession {
   /** Correlates log lines for this context. */
   readonly id: string;
+  /**
+   * The Playwright page for this context, handed to the OrderExecutor for DOM
+   * work. In the simulated backend this is a stub that throws on any DOM call
+   * (SHADOW_MODE never touches it); drive real DOM with BROWSER_SIMULATE=false.
+   */
+  readonly page: Page;
   /** Load a URL. In the simulated backend this is modelled, not fetched. */
   navigate(url: string): Promise<void>;
   /** Tear down the context (not the shared browser). */
@@ -71,8 +77,20 @@ export class BrowserManager {
   private async acquireSimulated(id: string): Promise<BrowserSession> {
     await delay(jitter(2, 8)); // model launch + context creation
     const navTimeout = this.navigationTimeoutMs;
+    // Stub page: any DOM access throws, so a misconfigured LIVE+simulate run
+    // surfaces loudly instead of silently "succeeding".
+    const noDom = (): never => {
+      throw new Error(
+        'BrowserManager(simulate): no real DOM; use SHADOW_MODE or BROWSER_SIMULATE=false',
+      );
+    };
+    const page = {
+      waitForSelector: async () => noDom(),
+      click: async () => noDom(),
+    } as unknown as Page;
     return {
       id,
+      page,
       async navigate(_url: string): Promise<void> {
         void navTimeout;
         await delay(jitter(1, 6)); // model a page load
@@ -90,6 +108,7 @@ export class BrowserManager {
     const navTimeout = this.navigationTimeoutMs;
     return {
       id,
+      page,
       async navigate(url: string): Promise<void> {
         await page.goto(url, { timeout: navTimeout });
       },

@@ -53,6 +53,12 @@ export interface AppConfig {
     /** E2E latency above this marks an execution as a failure. */
     maxE2ELatencyMs: number;
   };
+  execution: {
+    /** Max tolerated adverse relative slippage before an order is rejected. */
+    maxSlippageTolerance: number;
+    /** Per-selector wait budget when extracting odds / clicking. */
+    domSelectorTimeoutMs: number;
+  };
   browser: {
     /** When true, model the browser without launching real Chromium -- lets
      *  the harness run in CI with no browser binaries. Set BROWSER_SIMULATE=false
@@ -84,6 +90,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       failureThreshold: envNum(env, 'CIRCUIT_BREAKER_FAILURE_THRESHOLD', 3),
       resetTimeoutMs: envNum(env, 'CIRCUIT_BREAKER_RESET_TIMEOUT_MS', 30_000),
       maxE2ELatencyMs: envNum(env, 'MAX_ALLOWED_E2E_LATENCY_MS', 500),
+    },
+    execution: {
+      maxSlippageTolerance: envNum(env, 'MAX_SLIPPAGE_TOLERANCE', 0.02),
+      domSelectorTimeoutMs: envNum(env, 'DOM_SELECTOR_TIMEOUT_MS', 3_000),
     },
     browser: {
       simulate: envBool(env, 'BROWSER_SIMULATE', true),

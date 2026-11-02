@@ -26,6 +26,7 @@ import type { ApprovedOrder } from '../src/types/features.js';
 interface SyntheticOrder extends ApprovedOrder {
   scenario: string;
   targetUrl: string;
+  targetOdds: number;
 }
 
 // Valid-looking competitor ids (namespaced, as the analytics side keys them).
@@ -51,6 +52,9 @@ function order(
     // about:blank keeps the harness offline; the worker treats this as the
     // execution surface to "navigate" to.
     targetUrl: 'about:blank',
+    // Odds we want the bet placed against; the slippage guard compares the
+    // live DOM odds against this.
+    targetOdds: 2.0,
     market: 'match_winner',
     side: 'A',
     stake: 10,
