@@ -1,59 +1,58 @@
 /**
- * runWorker -- integration harness consumer.
+ * runWorker -- paper-trading consumer for the live-feed harness.
  *
- * Wires the real OrderWorker to a real Redis connection, a FeatureLoader backed
- * by a demo Feature Store (artificial latency so misses are visible against the
- * 50ms deadline), and a BrowserManager. Run this in one terminal, then run
- * `simulateOrder` in another to push work at it.
+ * Wires the full gateway against a real Redis: reads competitor features from
+ * `ta:player:<id>` (RedisFeatureStoreClient), drains the ApprovedOrder queue,
+ * records every emitted/simulated order in the SettlementService, settles
+ * matches from a `ClosedMatch` event stream, and serves /health, /metrics and
+ * /financial-report so the CLV & PnL audit can be watched live.
  *
- * Run (shadow mode, simulated browser -- no binaries needed):
+ * Pair it with scripts/liveFeedSimulator.ts (the producer).
+ *
+ * Run (paper trading -- shadow mode, simulated browser):
  *   SHADOW_MODE=true tsx scripts/runWorker.ts
- *
- * Drive a real browser instead:
- *   SHADOW_MODE=true BROWSER_SIMULATE=false tsx scripts/runWorker.ts
  */
 
 import { Redis } from 'ioredis';
 import { config } from '../src/config/index.js';
-import { FeatureLoader, FeatureStoreClient } from '../src/services/FeatureLoader.js';
+import { FeatureLoader } from '../src/services/FeatureLoader.js';
+import { RedisFeatureStoreClient } from '../src/services/RedisFeatureStoreClient.js';
 import { BrowserManager } from '../src/browser/BrowserManager.js';
-import { OrderWorker } from '../src/workers/OrderWorker.js';
+import { CircuitBreaker } from '../src/services/CircuitBreaker.js';
+import { MetricsCollector } from '../src/telemetry/MetricsCollector.js';
 import { OrderExecutor } from '../src/executors/OrderExecutor.js';
-import type { PlayerFeatures } from '../src/types/features.js';
+import { SettlementService } from '../src/services/SettlementService.js';
+import { OrderWorker } from '../src/workers/OrderWorker.js';
+import { createHealthServer } from '../src/server.js';
 
-/** Stand-in Feature Store: deterministic vectors with a realistic I/O delay. */
-function createDemoStore(delayMs = 25): FeatureStoreClient {
-  let fetches = 0;
-  return {
-    async fetch(playerId: string, signal: AbortSignal): Promise<PlayerFeatures> {
-      fetches++;
-      await new Promise<void>((resolve, reject) => {
-        const t = setTimeout(resolve, delayMs);
-        signal.addEventListener('abort', () => {
-          clearTimeout(t);
-          reject(new Error('aborted'));
-        });
-      });
-      // A stable pseudo-rating derived from the id, so runs are reproducible.
-      const seed = [...playerId].reduce((a, c) => a + c.charCodeAt(0), 0);
-      return {
-        id: playerId,
-        elo: 1800 + (seed % 400),
-        fatigueScore: seed % 50,
-        formRating: (seed % 20) - 10,
-        updatedAt: Date.now(),
-      };
-    },
-    get fetches(): number {
-      return fetches;
-    },
-  } as FeatureStoreClient & { fetches: number };
+const logger = console;
+const CLOSED_MATCH_QUEUE = 'ClosedMatch';
+
+interface CloseEvent {
+  matchId: string;
+  winner: string;
+  closingOdds: number;
 }
 
 async function main(): Promise<void> {
+  // Three connections: the worker's blocking BRPOP holds its socket, so feature
+  // reads and the close-event consumer each need their own.
   const redis = new Redis(config.redis.url, { maxRetriesPerRequest: null });
+  const featureRedis = new Redis(config.redis.url);
+  const closeRedis = new Redis(config.redis.url, { maxRetriesPerRequest: null });
+
+  const metrics = new MetricsCollector({ logger });
+  const breaker = new CircuitBreaker({
+    name: 'order-exec',
+    failureThreshold: config.circuitBreaker.failureThreshold,
+    resetTimeoutMs: config.circuitBreaker.resetTimeoutMs,
+    latencyThresholdMs: config.circuitBreaker.maxE2ELatencyMs,
+    logger,
+    onStateChange: (from, to) => metrics.recordCircuitTransition(from, to),
+  });
+  const settlement = new SettlementService({ redis: featureRedis, logger });
   const loader = new FeatureLoader({
-    client: createDemoStore(),
+    client: new RedisFeatureStoreClient({ redis: featureRedis, logger }),
     ttlMs: config.featureStore.ttlMs,
     fetchTimeoutMs: config.featureStore.fetchTimeoutMs,
     maxEntries: config.featureStore.maxEntries,
@@ -68,22 +67,68 @@ async function main(): Promise<void> {
     domSelectorTimeoutMs: config.execution.domSelectorTimeoutMs,
     shadowMode: config.shadowMode,
   });
-  const worker = new OrderWorker({ redis, loader, browser, executor });
+  const worker = new OrderWorker({ redis, loader, browser, executor, breaker, metrics, settlement });
 
-  const shutdown = async (): Promise<void> => {
-    console.log('\nrunWorker: shutting down...');
+  // --- Health / metrics / financial-report server ---
+  const server = createHealthServer({
+    metrics,
+    getCircuitState: () => breaker.getState(),
+    getFinancialReport: () => settlement.getFinancialReport(),
+    logger,
+  });
+  await new Promise<void>((resolve) => server.listen(config.server.httpPort, resolve));
+  logger.info(
+    `runWorker: serving /health /metrics /financial-report on :${config.server.httpPort} ` +
+      `(shadowMode=${config.shadowMode})`,
+  );
+
+  // --- Settlement consumer: close events published by the simulator ---
+  let settling = true;
+  const settleLoop = (async () => {
+    while (settling) {
+      let raw: [string, string] | null;
+      try {
+        raw = await closeRedis.brpop(CLOSED_MATCH_QUEUE, 5);
+      } catch (err) {
+        if (settling) logger.error(`runWorker: close BRPOP failed: ${(err as Error).message}`);
+        continue;
+      }
+      if (!raw) continue;
+      try {
+        const ev = JSON.parse(raw[1]) as CloseEvent;
+        const settled = settlement.settleMatch(ev.matchId, ev.winner, ev.closingOdds);
+        if (settled.length > 0) {
+          const r = settlement.getFinancialReport();
+          logger.info(
+            `runWorker: settled ${ev.matchId} (${settled.length}) | ` +
+              `PnL=${r.totalPnl} winRate=${r.winRatePct}% yield=${r.yieldPct}% BTCL=${r.btclRatePct}%`,
+          );
+        }
+      } catch (err) {
+        logger.error(`runWorker: settle failed: ${(err as Error).message}`);
+      }
+    }
+  })();
+
+  const shutdown = async (signal: string): Promise<void> => {
+    logger.info(`\nrunWorker: ${signal}, shutting down...`);
+    settling = false;
     worker.stop();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     await browser.close();
-    await redis.quit();
+    redis.disconnect();
+    featureRedis.disconnect();
+    closeRedis.disconnect();
+    await settleLoop.catch(() => undefined);
     process.exit(0);
   };
-  process.on('SIGINT', () => void shutdown());
-  process.on('SIGTERM', () => void shutdown());
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
   await worker.run();
 }
 
 main().catch((err) => {
-  console.error('runWorker: fatal:', err);
+  logger.error('runWorker: fatal:', err);
   process.exitCode = 1;
 });
