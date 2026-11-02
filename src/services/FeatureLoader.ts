@@ -33,11 +33,13 @@ import {
  */
 export interface FeatureStoreClient {
   /**
-   * Fetch one competitor's live features. MUST respect the AbortSignal: the
-   * loader arms a deadline and aborts on it, so a well-behaved client stops
-   * waiting on the wire instead of leaking a pending request.
+   * Fetch one competitor's live features, or `null` when the player is not in
+   * the store or the lookup failed -- the loader treats `null` exactly like a
+   * miss and degrades to the neutral fallback vector. MUST respect the
+   * AbortSignal: the loader arms a deadline and aborts on it, so a well-behaved
+   * client stops waiting on the wire instead of leaking a pending request.
    */
-  fetch(playerId: string, signal: AbortSignal): Promise<PlayerFeatures>;
+  fetch(playerId: string, signal: AbortSignal): Promise<PlayerFeatures | null>;
 }
 
 export interface FeatureLoaderOptions {
@@ -73,7 +75,7 @@ export class FeatureLoader {
    * call. Without this, N orders referencing a hot player on a cold cache
    * would each open a socket; with it, they share the single pending promise.
    */
-  private readonly inFlight = new Map<string, Promise<PlayerFeatures>>();
+  private readonly inFlight = new Map<string, Promise<PlayerFeatures | null>>();
 
   constructor(opts: FeatureLoaderOptions) {
     this.client = opts.client;
@@ -128,8 +130,12 @@ export class FeatureLoader {
 
     try {
       const features = await this.fetchCoalesced(playerId);
-      this.cache.set(playerId, features);
-      return { features, source: 'live' };
+      if (features !== null) {
+        this.cache.set(playerId, features);
+        return { features, source: 'live' };
+      }
+      // Player not in the store: a clean miss -> fallback (not cached).
+      this.logger.warn(`FeatureLoader: player ${playerId} not in store; using fallback`);
     } catch (err) {
       // Timeout or store failure: degrade, do not throw. The worker loop
       // keeps running; the payload carries the `fallback` flag so the
@@ -137,12 +143,12 @@ export class FeatureLoader {
       this.logger.warn(
         `FeatureLoader: fallback for player ${playerId}: ${(err as Error).message}`,
       );
-      return { features: neutralFeatures(playerId), source: 'fallback' };
     }
+    return { features: neutralFeatures(playerId), source: 'fallback' };
   }
 
   /** Share a single in-flight store call across concurrent misses. */
-  private fetchCoalesced(playerId: string): Promise<PlayerFeatures> {
+  private fetchCoalesced(playerId: string): Promise<PlayerFeatures | null> {
     const existing = this.inFlight.get(playerId);
     if (existing) return existing;
 
@@ -159,7 +165,7 @@ export class FeatureLoader {
    * at `fetchTimeoutMs` regardless, and the abort is a courtesy to let a
    * well-behaved client release the socket.
    */
-  private fetchWithDeadline(playerId: string): Promise<PlayerFeatures> {
+  private fetchWithDeadline(playerId: string): Promise<PlayerFeatures | null> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
 
