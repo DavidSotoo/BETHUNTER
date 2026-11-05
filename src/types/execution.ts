@@ -13,6 +13,9 @@
  * it must NOT count against the breaker.
  */
 
+import type { Page } from 'playwright';
+import type { HydratedOrderPayload } from './features.js';
+
 export type OrderExecutionStatus =
   | 'EXECUTED'
   | 'REJECTED_SLIPPAGE'
@@ -35,4 +38,17 @@ export interface OrderExecutionResult {
   /** Wall-clock cost of the execution leg in milliseconds. */
   latencyMs: number;
   error?: string;
+  /**
+   * The venue's own confirmation of the order (API-based executors). For
+   * MollyBet this is the order object returned by `POST /v1/orders/`.
+   */
+  confirmation?: Record<string, unknown>;
+}
+
+/**
+ * What the OrderWorker needs from any executor. The Playwright `OrderExecutor`
+ * uses the page; API-based executors (MollyBetExecutor) ignore it.
+ */
+export interface OrderExecutorPort {
+  executeOrder(page: Page, order: HydratedOrderPayload): Promise<OrderExecutionResult>;
 }

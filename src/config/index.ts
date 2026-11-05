@@ -74,6 +74,25 @@ export interface AppConfig {
     /** Port for the health / metrics HTTP server. */
     httpPort: number;
   };
+  /** Official BetInAsia BLACK (MollyBet) API. Credentials come from the env only. */
+  betinasia: {
+    /** BIA_API_URL: REST base URL. */
+    apiUrl: string;
+    /** BIA_WS_URL: websocket stream URL (the session token is appended as ?token=). */
+    wsUrl: string;
+    /** BIA_API_KEY: credential sent as the MollyBet login password. No default. */
+    apiKey: string;
+    /** BIA_ACCOUNT_ID: the MollyBet username. No default. */
+    accountId: string;
+    /** BIA_SPORT: sport code used in event/betslip requests. */
+    sport: string;
+    /** BIA_CURRENCY: ISO-4217 currency the stake is expressed in. */
+    currency: string;
+    /** BIA_ORDER_DURATION_SEC: how long an order stays open trying to fill. */
+    orderDurationSec: number;
+    /** BIA_REQUEST_TIMEOUT_MS: per-request budget for REST calls. */
+    requestTimeoutMs: number;
+  };
 }
 
 /** Build an AppConfig from an environment (defaults to process.env). */
@@ -107,6 +126,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     server: {
       httpPort: envNum(env, 'HTTP_PORT', 3000),
+    },
+    betinasia: {
+      apiUrl: envStr(env, 'BIA_API_URL', 'https://api.mollybet.com'),
+      wsUrl: envStr(env, 'BIA_WS_URL', 'wss://api.mollybet.com/v1/stream/'),
+      apiKey: envStr(env, 'BIA_API_KEY', ''),
+      accountId: envStr(env, 'BIA_ACCOUNT_ID', ''),
+      sport: envStr(env, 'BIA_SPORT', 'tennis'),
+      currency: envStr(env, 'BIA_CURRENCY', 'EUR'),
+      orderDurationSec: envNum(env, 'BIA_ORDER_DURATION_SEC', 15),
+      requestTimeoutMs: envNum(env, 'BIA_REQUEST_TIMEOUT_MS', 5_000),
     },
   };
 }

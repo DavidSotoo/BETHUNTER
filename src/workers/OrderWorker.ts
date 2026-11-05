@@ -32,8 +32,11 @@ import { performance } from 'node:perf_hooks';
 import { FeatureLoader } from '../services/FeatureLoader.js';
 import { BrowserManager, BrowserSession } from '../browser/BrowserManager.js';
 import { CircuitBreaker, CircuitState } from '../services/CircuitBreaker.js';
-import { OrderExecutor } from '../executors/OrderExecutor.js';
-import { OrderExecutionResult, OrderExecutionStatus } from '../types/execution.js';
+import {
+  OrderExecutionResult,
+  OrderExecutionStatus,
+  OrderExecutorPort,
+} from '../types/execution.js';
 import { MetricsCollector, OrderOutcome } from '../telemetry/MetricsCollector.js';
 import { SettlementService } from '../services/SettlementService.js';
 import { config as defaultConfig, AppConfig } from '../config/index.js';
@@ -48,7 +51,7 @@ export interface OrderWorkerOptions {
   loader: FeatureLoader;
   browser: BrowserManager;
   /** Places the order (with slippage guard). Omitted = pipeline runs, no bet. */
-  executor?: OrderExecutor;
+  executor?: OrderExecutorPort;
   /** Guards the pipeline. Defaults to one built from config. */
   breaker?: CircuitBreaker;
   /** Collects per-order telemetry. Defaults to a fresh collector. */
@@ -100,7 +103,7 @@ export class OrderWorker {
   private readonly redis: Redis;
   private readonly loader: FeatureLoader;
   private readonly browser: BrowserManager;
-  private readonly executor?: OrderExecutor;
+  private readonly executor?: OrderExecutorPort;
   private readonly breaker: CircuitBreaker;
   private readonly metrics: MetricsCollector;
   private readonly settlement?: SettlementService;
