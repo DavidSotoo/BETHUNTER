@@ -77,6 +77,12 @@ export function orderUuid(orderId: string): string {
 }
 
 export class MollyBetExecutor implements OrderExecutorPort {
+  /**
+   * API executor: the worker skips browser acquisition and navigation entirely
+   * and passes `undefined` for the page.
+   */
+  readonly needsBrowser = false;
+
   private readonly client: MollyBetClient;
   private readonly sport: string;
   private readonly currency: string;
@@ -101,7 +107,7 @@ export class MollyBetExecutor implements OrderExecutorPort {
     this.logger = opts.logger ?? console;
   }
 
-  /** `_page` is ignored: this executor is API-only (kept for OrderWorker compatibility). */
+  /** `_page` is always ignored: this executor is API-only. */
   async executeOrder(_page: unknown, order: HydratedOrderPayload): Promise<OrderExecutionResult> {
     const start = performance.now();
     const elapsed = (): number => performance.now() - start;
@@ -128,8 +134,18 @@ export class MollyBetExecutor implements OrderExecutorPort {
     if (!Number.isFinite(stake) || stake <= 0) {
       return fail(requested, 'order.stake must be a positive number');
     }
-    const eventId = typeof order.matchId === 'string' ? order.matchId : undefined;
-    if (!eventId) return fail(requested, 'order.matchId (MollyBet event_id) is missing');
+    // `marketId` is the explicit MollyBet event id stamped by the ingestor;
+    // `matchId` is the fallback for orders queued before that field existed.
+    const eventId =
+      (typeof order.marketId === 'string' && order.marketId.trim() !== ''
+        ? order.marketId
+        : undefined) ??
+      (typeof order.matchId === 'string' && order.matchId.trim() !== ''
+        ? order.matchId
+        : undefined);
+    if (!eventId) {
+      return fail(requested, 'order.marketId / order.matchId (MollyBet event_id) is missing');
+    }
 
     const side =
       order.selection === order.playerAId ? 'home' : order.selection === order.playerBId ? 'away' : undefined;

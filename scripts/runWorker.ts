@@ -9,18 +9,23 @@
  *
  * Pair it with scripts/liveFeedSimulator.ts (the producer).
  *
- * Run (paper trading -- shadow mode, simulated browser):
+ * Execution goes through MollyBetExecutor (official BetInAsia BLACK API), so
+ * there is no browser in this path. Keep SHADOW_MODE=true for paper trading:
+ * the executor then runs every check and posts nothing, which is also why this
+ * harness needs no BetInAsia credentials.
+ *
+ * Run (paper trading -- shadow mode, nothing placed):
  *   SHADOW_MODE=true tsx scripts/runWorker.ts
  */
 
 import { Redis } from 'ioredis';
-import { config } from '../src/config/index.js';
+import { config, assertBetInAsiaCredentials } from '../src/config/index.js';
 import { FeatureLoader } from '../src/services/FeatureLoader.js';
 import { RedisFeatureStoreClient } from '../src/services/RedisFeatureStoreClient.js';
-import { BrowserManager } from '../src/browser/BrowserManager.js';
 import { CircuitBreaker } from '../src/services/CircuitBreaker.js';
 import { MetricsCollector } from '../src/telemetry/MetricsCollector.js';
-import { OrderExecutor } from '../src/executors/OrderExecutor.js';
+import { MollyBetClient } from '../src/services/MollyBetClient.js';
+import { MollyBetExecutor } from '../src/executors/MollyBetExecutor.js';
 import { SettlementService } from '../src/services/SettlementService.js';
 import { OrderWorker } from '../src/workers/OrderWorker.js';
 import { createHealthServer } from '../src/server.js';
@@ -35,6 +40,10 @@ interface CloseEvent {
 }
 
 async function main(): Promise<void> {
+  // Warns under SHADOW_MODE, throws otherwise: this harness is meant to be run
+  // as paper trading, but it refuses to go live half-configured.
+  assertBetInAsiaCredentials(config, logger);
+
   // Three connections: the worker's blocking BRPOP holds its socket, so feature
   // reads and the close-event consumer each need their own.
   const redis = new Redis(config.redis.url, { maxRetriesPerRequest: null });
@@ -57,17 +66,25 @@ async function main(): Promise<void> {
     fetchTimeoutMs: config.featureStore.fetchTimeoutMs,
     maxEntries: config.featureStore.maxEntries,
   });
-  const browser = new BrowserManager({
-    simulate: config.browser.simulate,
-    headless: config.browser.headless,
-    navigationTimeoutMs: config.browser.navigationTimeoutMs,
+  const mollybet = new MollyBetClient({
+    apiUrl: config.betinasia.apiUrl,
+    username: config.betinasia.accountId,
+    password: config.betinasia.apiKey,
+    timeoutMs: config.betinasia.requestTimeoutMs,
+    logger,
   });
-  const executor = new OrderExecutor({
+  const executor = new MollyBetExecutor({
+    client: mollybet,
+    sport: config.betinasia.sport,
+    currency: config.betinasia.currency,
+    orderDurationSec: config.betinasia.orderDurationSec,
     maxSlippageTolerance: config.execution.maxSlippageTolerance,
-    domSelectorTimeoutMs: config.execution.domSelectorTimeoutMs,
     shadowMode: config.shadowMode,
+    breaker,
+    logger,
   });
-  const worker = new OrderWorker({ redis, loader, browser, executor, breaker, metrics, settlement });
+  // API executor: no BrowserManager, so no context is acquired per order.
+  const worker = new OrderWorker({ redis, loader, executor, breaker, metrics, settlement });
 
   // --- Health / metrics / financial-report server ---
   const server = createHealthServer({
@@ -79,7 +96,7 @@ async function main(): Promise<void> {
   await new Promise<void>((resolve) => server.listen(config.server.httpPort, resolve));
   logger.info(
     `runWorker: serving /health /metrics /financial-report on :${config.server.httpPort} ` +
-      `(shadowMode=${config.shadowMode})`,
+      `(shadowMode=${config.shadowMode}, executor=MollyBet API)`,
   );
 
   // --- Settlement consumer: close events published by the simulator ---
@@ -115,7 +132,6 @@ async function main(): Promise<void> {
     settling = false;
     worker.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    await browser.close();
     redis.disconnect();
     featureRedis.disconnect();
     closeRedis.disconnect();

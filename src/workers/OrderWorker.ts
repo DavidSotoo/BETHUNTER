@@ -4,9 +4,18 @@
  *
  *   BRPOP ApprovedOrder
  *     -> FeatureLoader.hydrate        (live competitor vectors)
- *     -> BrowserManager.acquire       (isolated Playwright context)
- *     -> navigate                     (load the execution surface)
- *     -> OrderExecutor.executeOrder   (slippage guard + place-bet, DOM)
+ *     -> BrowserManager.acquire       (isolated Playwright context) [DOM only]
+ *     -> navigate                     (load the execution surface)  [DOM only]
+ *     -> executor.executeOrder        (slippage guard + placement)
+ *
+ * TWO EXECUTOR KINDS
+ *
+ * The executor is injected behind `OrderExecutorPort`:
+ *   - DOM  (`OrderExecutor`):     needs a Playwright page, so the worker
+ *                                 acquires a browser session and navigates.
+ *   - API  (`MollyBetExecutor`):  declares `needsBrowser = false`, so the
+ *                                 browser legs are skipped entirely and the
+ *                                 page is `undefined`. No browser is required.
  *
  * SHADOW MODE
  *
@@ -36,6 +45,7 @@ import {
   OrderExecutionResult,
   OrderExecutionStatus,
   OrderExecutorPort,
+  executorNeedsBrowser,
 } from '../types/execution.js';
 import { MetricsCollector, OrderOutcome } from '../telemetry/MetricsCollector.js';
 import { SettlementService } from '../services/SettlementService.js';
@@ -49,7 +59,11 @@ import {
 export interface OrderWorkerOptions {
   redis: Redis;
   loader: FeatureLoader;
-  browser: BrowserManager;
+  /**
+   * Supplies the Playwright session for a DOM executor. Not needed (and not
+   * used) when the executor is API-based, e.g. MollyBetExecutor.
+   */
+  browser?: BrowserManager;
   /** Places the order (with slippage guard). Omitted = pipeline runs, no bet. */
   executor?: OrderExecutorPort;
   /** Guards the pipeline. Defaults to one built from config. */
@@ -102,7 +116,9 @@ function isBlockError(msg: string | undefined): boolean {
 export class OrderWorker {
   private readonly redis: Redis;
   private readonly loader: FeatureLoader;
-  private readonly browser: BrowserManager;
+  private readonly browser?: BrowserManager;
+  /** True when the configured executor needs a browser page. */
+  private readonly needsBrowser: boolean;
   private readonly executor?: OrderExecutorPort;
   private readonly breaker: CircuitBreaker;
   private readonly metrics: MetricsCollector;
@@ -116,6 +132,7 @@ export class OrderWorker {
     this.loader = opts.loader;
     this.browser = opts.browser;
     this.executor = opts.executor;
+    this.needsBrowser = opts.executor ? executorNeedsBrowser(opts.executor) : false;
     this.settlement = opts.settlement;
     this.config = opts.config ?? defaultConfig;
     this.logger = opts.logger ?? console;
@@ -131,6 +148,12 @@ export class OrderWorker {
         // Feed circuit transitions straight into telemetry.
         onStateChange: (from, to) => this.metrics.recordCircuitTransition(from, to),
       });
+
+    if (this.needsBrowser && !this.browser) {
+      throw new Error(
+        'OrderWorker: this executor needs a browser page but no BrowserManager was supplied',
+      );
+    }
   }
 
   /** The telemetry collector, for exporting a performance snapshot. */
@@ -143,8 +166,10 @@ export class OrderWorker {
     this.running = true;
     const { queueKey } = this.config.redis;
     this.logger.info(
-      `OrderWorker: draining "${queueKey}" ` +
-        `(shadowMode=${this.config.shadowMode}, browserSimulate=${this.config.browser.simulate})`,
+      `OrderWorker: draining "${queueKey}" (shadowMode=${this.config.shadowMode}, ` +
+        (this.needsBrowser
+          ? `executor=DOM, browserSimulate=${this.config.browser.simulate})`
+          : 'executor=API, browser=skipped)'),
     );
 
     while (this.running) {
@@ -201,21 +226,23 @@ export class OrderWorker {
       hydrationLatencyMs = hydrated.hydrationLatencyMs;
       hydrationSource = aggregateSource(hydrated.hydrationSource);
 
-      // --- 2. Browser acquisition leg ---
-      const acqStart = performance.now();
-      session = await this.browser.acquire();
-      browserAcquisitionMs = performance.now() - acqStart;
+      // --- 2 + 3. Browser legs: DOM executors only. An API executor places
+      //     the order over HTTP, so launching a context would be dead weight.
+      if (this.needsBrowser && this.browser) {
+        const acqStart = performance.now();
+        session = await this.browser.acquire();
+        browserAcquisitionMs = performance.now() - acqStart;
 
-      // --- 3. Navigate to the execution surface ---
-      const targetUrl =
-        typeof order.targetUrl === 'string'
-          ? order.targetUrl
-          : this.config.browser.defaultTargetUrl;
-      await session.navigate(targetUrl);
+        const targetUrl =
+          typeof order.targetUrl === 'string'
+            ? order.targetUrl
+            : this.config.browser.defaultTargetUrl;
+        await session.navigate(targetUrl);
+      }
 
       // --- 4. Execute with the slippage guard (shadow-aware inside) ---
       if (this.executor) {
-        execution = await this.executor.executeOrder(session.page, hydrated);
+        execution = await this.executor.executeOrder(session?.page, hydrated);
         // Only a genuine DOM/execution fault counts against the breaker; a
         // slippage rejection is a healthy, intentional outcome.
         success = execution.status !== 'FAILED_DOM';

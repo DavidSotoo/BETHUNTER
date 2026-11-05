@@ -46,9 +46,21 @@ export interface OrderExecutionResult {
 }
 
 /**
- * What the OrderWorker needs from any executor. The Playwright `OrderExecutor`
- * uses the page; API-based executors (MollyBetExecutor) ignore it.
+ * What the OrderWorker needs from any executor.
+ *
+ * `page` is a Playwright page for DOM-based executors (`OrderExecutor`) and
+ * `undefined` for API-based ones (`MollyBetExecutor`), which the worker runs
+ * without acquiring a browser at all. An executor that needs the page must
+ * fail cleanly when it is absent rather than dereferencing it.
  */
 export interface OrderExecutorPort {
-  executeOrder(page: Page, order: HydratedOrderPayload): Promise<OrderExecutionResult>;
+  executeOrder(
+    page: Page | undefined,
+    order: HydratedOrderPayload,
+  ): Promise<OrderExecutionResult>;
+}
+
+/** Does this executor need a browser session? API executors do not. */
+export function executorNeedsBrowser(e: OrderExecutorPort): boolean {
+  return (e as { readonly needsBrowser?: boolean }).needsBrowser !== false;
 }
