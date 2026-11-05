@@ -15,6 +15,7 @@
     "simulate": "tsx scripts/simulateOrder.ts",
     "feed": "tsx scripts/liveFeedSimulator.ts",
     "live-feed": "tsx scripts/runLiveFeed.ts",
+    "live-mollybet": "tsx scripts/runMollyBetLive.ts",
     "start": "node dist/index.js"
   },
   "dependencies": {

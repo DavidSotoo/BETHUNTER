@@ -54,6 +54,10 @@ export interface AppConfig {
     maxE2ELatencyMs: number;
   };
   execution: {
+    /** MIN_EV: minimum +EV for the ingestor to qualify an order. */
+    minEv: number;
+    /** STAKE_UNIT: stake stamped on each qualified order. */
+    stakeUnit: number;
     /** Max tolerated adverse relative slippage before an order is rejected. */
     maxSlippageTolerance: number;
     /** Per-selector wait budget when extracting odds / clicking. */
@@ -123,6 +127,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxE2ELatencyMs: envNum(env, 'MAX_ALLOWED_E2E_LATENCY_MS', 500),
     },
     execution: {
+      minEv: envNum(env, 'MIN_EV', 0.02),
+      stakeUnit: envNum(env, 'STAKE_UNIT', 10),
       maxSlippageTolerance: envNum(env, 'MAX_SLIPPAGE_TOLERANCE', 0.02),
       domSelectorTimeoutMs: envNum(env, 'DOM_SELECTOR_TIMEOUT_MS', 3_000),
     },
@@ -151,6 +157,28 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       pollIntervalMs: envNum(env, 'FEED_POLL_INTERVAL_MS', 2_000),
     },
   };
+}
+
+/**
+ * Fail fast when the BetInAsia credentials are missing. The API entrypoints
+ * call this before wiring anything, so a misconfigured deploy stops at startup
+ * instead of failing on the first order. Shadow mode places nothing, so it
+ * only warns.
+ */
+export function assertBetInAsiaCredentials(
+  cfg: AppConfig = config,
+  logger: Pick<Console, 'warn'> = console,
+): void {
+  const missing: string[] = [];
+  if (cfg.betinasia.apiKey === '') missing.push('BIA_API_KEY');
+  if (cfg.betinasia.accountId === '') missing.push('BIA_ACCOUNT_ID');
+  if (missing.length === 0) return;
+  const msg = `BetInAsia credentials missing: ${missing.join(', ')}`;
+  if (cfg.shadowMode) {
+    logger.warn(`config: ${msg} (tolerated: SHADOW_MODE places no orders)`);
+    return;
+  }
+  throw new Error(`${msg}. Set them, or run with SHADOW_MODE=true.`);
 }
 
 /** Process-wide singleton, resolved once at import. */

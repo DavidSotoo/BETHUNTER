@@ -2,20 +2,29 @@
  * Production entrypoint for the Execution Gateway.
  *
  * Wires the full pipeline -- config, MetricsCollector, CircuitBreaker,
- * BrowserManager, FeatureLoader, OrderExecutor, OrderWorker -- starts the
+ * FeatureLoader, MollyBetClient, MollyBetExecutor, OrderWorker -- starts the
  * health/metrics HTTP server, then drains the Redis queue. Handles SIGINT /
  * SIGTERM with a graceful shutdown: stop consuming, close the HTTP server,
- * release the browser and Redis connection, then exit cleanly.
+ * disconnect Redis, then exit cleanly.
+ *
+ * Execution goes through the official BetInAsia BLACK (MollyBet) API, so there
+ * is no browser in this path at all.
+ *
+ * SLIPPAGE GUARD: this entrypoint consumes a queue and has no odds stream of
+ * its own, so the executor's client-side live-price check has nothing to
+ * compare against; the server-side minimum-price floor still applies to every
+ * order. For the full guard (live price + floor) run scripts/runMollyBetLive.ts,
+ * which owns the stream and feeds it to the executor.
  */
 
 import { Redis } from 'ioredis';
-import { config } from './config/index.js';
+import { config, assertBetInAsiaCredentials } from './config/index.js';
 import { MetricsCollector } from './telemetry/MetricsCollector.js';
 import { CircuitBreaker } from './services/CircuitBreaker.js';
-import { BrowserManager } from './browser/BrowserManager.js';
 import { FeatureLoader } from './services/FeatureLoader.js';
 import { RedisFeatureStoreClient } from './services/RedisFeatureStoreClient.js';
-import { OrderExecutor } from './executors/OrderExecutor.js';
+import { MollyBetClient } from './services/MollyBetClient.js';
+import { MollyBetExecutor } from './executors/MollyBetExecutor.js';
 import { OrderWorker } from './workers/OrderWorker.js';
 import { SettlementService } from './services/SettlementService.js';
 import { createHealthServer } from './server.js';
@@ -23,6 +32,9 @@ import { createHealthServer } from './server.js';
 const logger = console;
 
 async function main(): Promise<void> {
+  // Stop a misconfigured deploy at startup, not on the first order.
+  assertBetInAsiaCredentials(config, logger);
+
   // --- Shared telemetry + resilience (constructed first so both the worker
   //     and the health server observe the same state). ---
   const metrics = new MetricsCollector({ logger });
@@ -46,23 +58,33 @@ async function main(): Promise<void> {
     fetchTimeoutMs: config.featureStore.fetchTimeoutMs,
     maxEntries: config.featureStore.maxEntries,
   });
-  const browser = new BrowserManager({
-    simulate: config.browser.simulate,
-    headless: config.browser.headless,
-    navigationTimeoutMs: config.browser.navigationTimeoutMs,
+  // Official BetInAsia BLACK (MollyBet) API: one authenticated session shared
+  // by the executor. In shadow mode nothing is ever posted to it.
+  const mollybet = new MollyBetClient({
+    apiUrl: config.betinasia.apiUrl,
+    username: config.betinasia.accountId,
+    password: config.betinasia.apiKey,
+    timeoutMs: config.betinasia.requestTimeoutMs,
+    logger,
   });
-  const executor = new OrderExecutor({
+  const executor = new MollyBetExecutor({
+    client: mollybet,
+    sport: config.betinasia.sport,
+    currency: config.betinasia.currency,
+    orderDurationSec: config.betinasia.orderDurationSec,
     maxSlippageTolerance: config.execution.maxSlippageTolerance,
-    domSelectorTimeoutMs: config.execution.domSelectorTimeoutMs,
     shadowMode: config.shadowMode,
+    breaker,
+    logger,
   });
   // Shared across worker (records emitted orders) and server (reports); writes
   // through to Redis for durable audit on the feature-store connection.
   const settlement = new SettlementService({ redis: featureRedis, logger });
+  // No `browser`: MollyBetExecutor is API-based, so the worker skips browser
+  // acquisition and navigation entirely.
   const worker = new OrderWorker({
     redis,
     loader,
-    browser,
     executor,
     breaker,
     metrics,
@@ -88,7 +110,6 @@ async function main(): Promise<void> {
     try {
       worker.stop(); // stop pulling new work
       await new Promise<void>((resolve) => server.close(() => resolve())); // drain HTTP
-      await browser.close(); // release Chromium / contexts
       redis.disconnect(); // drop the (possibly blocked BRPOP) connection
       featureRedis.disconnect(); // drop the Feature Store connection
       logger.info('index: shutdown complete');
@@ -103,7 +124,8 @@ async function main(): Promise<void> {
 
   // --- Run (blocks until worker.stop()) ---
   logger.info(
-    `index: Execution Gateway starting (shadowMode=${config.shadowMode}, browserSimulate=${config.browser.simulate})`,
+    `index: Execution Gateway starting (shadowMode=${config.shadowMode}, ` +
+      `executor=MollyBet API, account=${config.betinasia.accountId || 'unset'})`,
   );
   await worker.run();
 }

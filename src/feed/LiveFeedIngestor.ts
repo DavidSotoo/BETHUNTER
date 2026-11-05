@@ -12,6 +12,16 @@
  * The network transport is injected (`connect`), so the ingestor is agnostic to
  * WebSocket vs polling and is unit-testable with a mocked connection. It
  * reconnects on close/error with a defensive exponential backoff.
+ *
+ * RATINGS
+ *
+ * The +EV screen needs an Elo for both sides. Some feeds carry ratings in the
+ * message itself (the simulator does); an odds-only feed such as MollyBet does
+ * not. For those, inject `ratings`: a resolver -- normally backed by the
+ * RedisFeatureStoreClient over `ta:player:<id>` -- which the ingestor consults
+ * for any side the message did not price. Only ratings that arrived *on the
+ * message* are written back to Redis, so a resolved rating is never echoed
+ * into the store it came from.
  */
 
 /** A live connection: the ingestor only needs to observe its events. */
@@ -56,6 +66,15 @@ export interface NormalizedMatch {
   targetUrl?: string;
 }
 
+/**
+ * Looks up a player's rating when the feed message does not carry one.
+ * Returns undefined for a miss; it must not throw (a rejection is logged and
+ * treated as a miss, leaving the match unqualified rather than mispriced).
+ */
+export type RatingResolver = (
+  playerId: string,
+) => Promise<PlayerRating | undefined> | PlayerRating | undefined;
+
 export interface BackoffOptions {
   baseMs?: number;
   factor?: number;
@@ -75,6 +94,11 @@ export interface LiveFeedIngestorOptions {
   stakeUnit?: number;
   /** Namespace for canonical player ids. Default "atp". */
   tour?: string;
+  /**
+   * Fills in ratings the feed does not carry (e.g. MollyBet, odds only), so the
+   * +EV screen can run. Usually a RedisFeatureStoreClient lookup.
+   */
+  ratings?: RatingResolver;
   backoff?: BackoffOptions;
   logger?: Pick<Console, 'info' | 'warn' | 'error'>;
 }
@@ -204,6 +228,7 @@ export class LiveFeedIngestor {
   private readonly minEv: number;
   private readonly stakeUnit: number;
   private readonly tour: string;
+  private readonly ratings?: RatingResolver;
   private readonly baseMs: number;
   private readonly factor: number;
   private readonly maxMs: number;
@@ -224,6 +249,7 @@ export class LiveFeedIngestor {
     this.minEv = opts.minEv ?? 0.02;
     this.stakeUnit = opts.stakeUnit ?? 10;
     this.tour = opts.tour ?? 'atp';
+    this.ratings = opts.ratings;
     this.baseMs = opts.backoff?.baseMs ?? 500;
     this.factor = opts.backoff?.factor ?? 2;
     this.maxMs = opts.backoff?.maxMs ?? 30_000;
@@ -325,7 +351,11 @@ export class LiveFeedIngestor {
         this.logger.warn(`LiveFeedIngestor: ${m.matchId} finished without a settleable winner/odds`);
       }
     } else if (m.status !== 'SUSPENDED') {
-      for (const order of this.qualifyOrders(m)) {
+      // Resolve any rating the message did not carry (odds-only feeds), then
+      // screen for +EV. Resolved ratings are used, never written back.
+      const ratingA = m.ratingA ?? (await this.resolveRating(m.playerAId));
+      const ratingB = m.ratingB ?? (await this.resolveRating(m.playerBId));
+      for (const order of this.qualifyOrders(m, ratingA, ratingB)) {
         pipeline.lpush(this.approvedOrderQueue, JSON.stringify(order));
         ops++;
       }
@@ -334,10 +364,27 @@ export class LiveFeedIngestor {
     if (ops > 0) await pipeline.exec();
   }
 
+  /** One rating lookup; a miss or a failure leaves the side unpriced. */
+  private async resolveRating(playerId: string): Promise<PlayerRating | undefined> {
+    if (!this.ratings) return undefined;
+    try {
+      return (await this.ratings(playerId)) ?? undefined;
+    } catch (err) {
+      this.logger.warn(
+        `LiveFeedIngestor: rating lookup for ${playerId} failed: ${(err as Error).message}`,
+      );
+      return undefined;
+    }
+  }
+
   /** +EV screen: back a side only when model prob * market odds beats minEv. */
-  private qualifyOrders(m: NormalizedMatch): Record<string, unknown>[] {
-    const eloA = m.ratingA?.elo;
-    const eloB = m.ratingB?.elo;
+  private qualifyOrders(
+    m: NormalizedMatch,
+    ratingA: PlayerRating | undefined = m.ratingA,
+    ratingB: PlayerRating | undefined = m.ratingB,
+  ): Record<string, unknown>[] {
+    const eloA = ratingA?.elo;
+    const eloB = ratingB?.elo;
     if (eloA === undefined || eloB === undefined) return [];
     const pA = 1 / (1 + 10 ** ((eloB - eloA) / 400));
 
@@ -354,6 +401,12 @@ export class LiveFeedIngestor {
       orders.push({
         orderId: `ord-${m.matchId}-${s.selection}`,
         matchId: m.matchId,
+        /**
+         * The venue-side id the executor places against. For MollyBet this is
+         * the event_id the provider put in matchId; carried explicitly so the
+         * executor never has to guess which field is the venue's.
+         */
+        marketId: m.matchId,
         playerAId: m.playerAId,
         playerBId: m.playerBId,
         selection: s.selection,

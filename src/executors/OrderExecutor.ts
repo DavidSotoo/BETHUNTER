@@ -24,7 +24,7 @@
 import type { Page } from 'playwright';
 import { performance } from 'node:perf_hooks';
 import { HydratedOrderPayload } from '../types/features.js';
-import { OrderExecutionResult } from '../types/execution.js';
+import { OrderExecutionResult, OrderExecutorPort } from '../types/execution.js';
 
 export interface OrderExecutorOptions {
   /** Max tolerated adverse relative slippage. Default 0.02 (2%). */
@@ -46,7 +46,10 @@ export interface OrderExecutorOptions {
   simulateOdds?: (requestedOdds: number) => number;
 }
 
-export class OrderExecutor {
+export class OrderExecutor implements OrderExecutorPort {
+  /** DOM executor: the worker must hand it a browser page. */
+  readonly needsBrowser = true;
+
   private readonly maxSlippage: number;
   private readonly domTimeout: number;
   private readonly shadowMode: boolean;
@@ -65,7 +68,10 @@ export class OrderExecutor {
     this.simulateOdds = opts.simulateOdds ?? ((r) => r);
   }
 
-  async executeOrder(page: Page, order: HydratedOrderPayload): Promise<OrderExecutionResult> {
+  async executeOrder(
+    page: Page | undefined,
+    order: HydratedOrderPayload,
+  ): Promise<OrderExecutionResult> {
     const start = performance.now();
     const elapsed = (): number => performance.now() - start;
     const requestedOdds = this.readRequestedOdds(order);
@@ -102,6 +108,17 @@ export class OrderExecutor {
     }
 
     // --- LIVE: extract the real odds from the DOM. ---
+    if (!page) {
+      return {
+        success: false,
+        requestedOdds,
+        slippage: 0,
+        status: 'FAILED_DOM',
+        latencyMs: elapsed(),
+        error: 'OrderExecutor needs a browser page: none was supplied',
+      };
+    }
+
     let executedOdds: number;
     try {
       const handle = await page.waitForSelector(this.oddsSelectorFor(order), {
