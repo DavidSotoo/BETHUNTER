@@ -93,6 +93,14 @@ export interface AppConfig {
     /** BIA_REQUEST_TIMEOUT_MS: per-request budget for REST calls. */
     requestTimeoutMs: number;
   };
+  feed: {
+    /** Live feed WebSocket URL. */
+    wsUrl: string;
+    /** API key sent on connect (header / query), if the feed requires one. */
+    apiKey: string;
+    /** Polling fallback interval in ms (for a polling transport). */
+    pollIntervalMs: number;
+  };
 }
 
 /** Build an AppConfig from an environment (defaults to process.env). */
@@ -136,6 +144,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       currency: envStr(env, 'BIA_CURRENCY', 'EUR'),
       orderDurationSec: envNum(env, 'BIA_ORDER_DURATION_SEC', 15),
       requestTimeoutMs: envNum(env, 'BIA_REQUEST_TIMEOUT_MS', 5_000),
+    },
+    feed: {
+      wsUrl: envStr(env, 'FEED_WS_URL', 'wss://localhost:9443/feed'),
+      apiKey: envStr(env, 'FEED_API_KEY', ''),
+      pollIntervalMs: envNum(env, 'FEED_POLL_INTERVAL_MS', 2_000),
     },
   };
 }

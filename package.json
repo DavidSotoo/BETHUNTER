@@ -14,15 +14,18 @@
     "worker": "tsx scripts/runWorker.ts",
     "simulate": "tsx scripts/simulateOrder.ts",
     "feed": "tsx scripts/liveFeedSimulator.ts",
+    "live-feed": "tsx scripts/runLiveFeed.ts",
     "start": "node dist/index.js"
   },
   "dependencies": {
     "ioredis": "5.4.1",
     "lru-cache": "11.0.2",
-    "playwright": "1.49.1"
+    "playwright": "1.49.1",
+    "ws": "8.18.0"
   },
   "devDependencies": {
     "@types/node": "22.10.2",
+    "@types/ws": "8.5.13",
     "tsx": "4.19.2",
     "typescript": "5.7.2",
     "vitest": "2.1.8"
